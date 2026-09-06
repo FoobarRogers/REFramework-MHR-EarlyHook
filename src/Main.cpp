@@ -17,6 +17,7 @@ extern "C" {
 
 #include "mods/IntegrityCheckBypass.hpp"
 #include "ExceptionHandler.hpp"
+#include "MHREarlyHookProbe.hpp"
 #include "REFramework.hpp"
 
 HMODULE g_dinput = 0;
@@ -81,6 +82,11 @@ __declspec(dllexport) HRESULT WINAPI
 }
 
 void startup_thread(HMODULE reframework_module) {
+    // Test7: run the MH Rise resource probe before exception setup, system dinput8
+    // loading, REFramework construction, mod initialization, Lua, or PluginLoader.
+    // The probe is diagnostic only and never changes game return values.
+    mhr_early_hook_probe::initialize();
+
     // We will set it once here, then do it continuously
     // every now and then because it gets replaced
     reframework::setup_exception_handler();
@@ -119,6 +125,7 @@ void startup_thread(HMODULE reframework_module) {
 BOOL APIENTRY DllMain(HANDLE handle, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         REFramework::set_reframework_module((HMODULE)handle);
+        mhr_early_hook_probe::set_attach_tick(GetTickCount64());
 
         const auto game = utility::get_executable();
         const auto module_size = utility::get_module_size(game).value_or(0);
