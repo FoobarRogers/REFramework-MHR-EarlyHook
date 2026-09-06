@@ -1,4 +1,4 @@
-name: Build MHR EarlyHook Test8
+name: Build MHR EarlyHook Test8b
 
 on:
   push:
@@ -29,28 +29,29 @@ jobs:
       - name: Build REFramework dinput8.dll
         run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target REFramework
 
-      - name: Package Test8
+      - name: Package Test8b
         shell: powershell
         run: |
-          $package = "${{github.workspace}}/Test8"
+          $package = "${{github.workspace}}/Test8b"
           New-Item -ItemType Directory -Force -Path $package | Out-Null
           Copy-Item "${{github.workspace}}/build/bin/REFramework/dinput8.dll" "$package/dinput8.dll"
           "${{github.sha}}" | Set-Content "$package/reframework_revision.txt"
           @"
-          MHR EarlyHook Test8
+          MHR EarlyHook Test8b (scan-only)
           Base: REFramework 849c35a041fa4d748b42a2fb5ebe53f402875311
           Branch: test/mhr-early-hook
 
-          Diagnostic build only. It polls the MHR executable from REFramework startup and installs PathToHash / CheckFileInPak diagnostics immediately when their byte patterns first become available. It never changes either function's return value.
+          Diagnostic build only. Test8b NEVER installs PathToHash or CheckFileInPak hooks and never modifies MonsterHunterRise.exe code.
+          It polls the exact RVAs discovered by Test8 every 1 ms, records when each signature first becomes available, and then observes whether those bytes remain stable or are rewritten/disappear during startup.
 
-          It writes mhr_earlyhook_test8.log to the MonsterHunterRise game directory.
+          It writes mhr_earlyhook_test8b.log to the MonsterHunterRise game directory.
           For a clean timing test, disable the built-in Loose File Loader and temporarily remove reframework/plugins/FirstNatives.dll.
-          "@ | Set-Content "$package/TEST8_README.txt"
-          Compress-Archive -Path "$package/*" -DestinationPath "${{github.workspace}}/REFramework-MHR-EarlyHook-Test8.zip" -Force
+          "@ | Set-Content "$package/TEST8B_README.txt"
+          Compress-Archive -Path "$package/*" -DestinationPath "${{github.workspace}}/REFramework-MHR-EarlyHook-Test8b.zip" -Force
 
-      - name: Upload Test8 artifact
+      - name: Upload Test8b artifact
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
         with:
-          name: REFramework-MHR-EarlyHook-Test8
-          path: ${{github.workspace}}/REFramework-MHR-EarlyHook-Test8.zip
+          name: REFramework-MHR-EarlyHook-Test8b
+          path: ${{github.workspace}}/REFramework-MHR-EarlyHook-Test8b.zip
           if-no-files-found: error
