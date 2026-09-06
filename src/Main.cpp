@@ -36,6 +36,9 @@ namespace {
 constexpr std::uint64_t kVoiceHashNonStreaming = 0x2DF225C5E2B3D254ULL;
 constexpr std::uint64_t kVoiceHashStreaming = 0xB8760B4CE9D1EC2DULL;
 constexpr std::size_t kMaxVoicePathLogs = 256;
+constexpr std::size_t kMaxSampleLogs = 8;
+constexpr std::uint64_t kPollTimeoutMs = 30000;
+constexpr DWORD kPollSleepMs = 10;
 
 using PathToHashFn = std::uint64_t (*)(wchar_t*);
 using CheckFileInPakFn = int (*)(void*, std::uint64_t);
@@ -46,6 +49,8 @@ CheckFileInPakFn g_check_file_in_pak_original{};
 std::atomic<std::uint64_t> g_attach_tick{0};
 std::atomic<bool> g_initialized{false};
 std::atomic<std::size_t> g_voice_path_log_count{0};
+std::atomic<std::size_t> g_path_call_count{0};
+std::atomic<std::size_t> g_pak_call_count{0};
 std::mutex g_log_mutex{};
 
 struct Pattern {
@@ -70,7 +75,7 @@ std::wstring log_path() {
     std::wstring buffer(32768, L'\0');
     const auto length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
     if (length == 0 || length >= buffer.size()) {
-        return L"mhr_earlyhook_test7.log";
+        return L"mhr_earlyhook_test8.log";
     }
 
     buffer.resize(length);
@@ -81,7 +86,7 @@ std::wstring log_path() {
         buffer.clear();
     }
 
-    buffer += L"mhr_earlyhook_test7.log";
+    buffer += L"mhr_earlyhook_test8.log";
     return buffer;
 }
 
@@ -97,7 +102,7 @@ void write_log(const char* fmt, ...) {
     const auto delta = now >= attach ? now - attach : 0;
 
     char line[3584]{};
-    snprintf(line, sizeof(line), "[MHR EarlyHook Test7 +%llums] %s\r\n",
+    snprintf(line, sizeof(line), "[MHR EarlyHook Test8 +%llums] %s\r\n",
              static_cast<unsigned long long>(delta), message);
 
     OutputDebugStringA(line);
@@ -165,50 +170,67 @@ std::vector<ScanRange> executable_ranges() {
     return ranges;
 }
 
-std::vector<std::uint8_t*> scan_all(Pattern pattern) {
-    std::vector<std::uint8_t*> matches{};
-    if (pattern.bytes == nullptr || pattern.size == 0) {
-        return matches;
+struct MatchState {
+    std::uint8_t* first{};
+    std::size_t count{};
+};
+
+struct TargetScanResult {
+    MatchState path_to_hash{};
+    MatchState check_primary{};
+    MatchState check_fallback{};
+};
+
+void record_match(MatchState& state, std::uint8_t* address) {
+    if (state.count == 0) {
+        state.first = address;
     }
+    ++state.count;
+}
 
-    for (const auto& range : executable_ranges()) {
-        if (range.size < pattern.size) {
-            continue;
-        }
+bool pattern_matches(const std::uint8_t* address, std::size_t remaining, const std::uint8_t* pattern, std::size_t pattern_size) {
+    return remaining >= pattern_size && memcmp(address, pattern, pattern_size) == 0;
+}
 
-        for (std::size_t i = 0; i <= range.size - pattern.size; ++i) {
-            if (memcmp(range.begin + i, pattern.bytes, pattern.size) == 0) {
-                matches.push_back(range.begin + i);
+TargetScanResult scan_targets_once(const std::vector<ScanRange>& ranges, bool need_path, bool need_pak) {
+    TargetScanResult result{};
+
+    for (const auto& range : ranges) {
+        for (std::size_t i = 0; i < range.size; ++i) {
+            auto* address = range.begin + i;
+            const auto remaining = range.size - i;
+
+            // All three known signatures start with either 0x40 or 0x48.
+            // Checking the first byte before memcmp keeps repeated Test8 scans cheap.
+            if (need_path && *address == kPathToHashPattern[0] &&
+                pattern_matches(address, remaining, kPathToHashPattern, sizeof(kPathToHashPattern))) {
+                record_match(result.path_to_hash, address);
+            }
+
+            if (need_pak && *address == kCheckFileInPakPattern1[0]) {
+                if (pattern_matches(address, remaining, kCheckFileInPakPattern1, sizeof(kCheckFileInPakPattern1))) {
+                    record_match(result.check_primary, address);
+                }
+                if (pattern_matches(address, remaining, kCheckFileInPakPattern2, sizeof(kCheckFileInPakPattern2))) {
+                    record_match(result.check_fallback, address);
+                }
             }
         }
     }
 
-    return matches;
-}
-
-void* scan_unique(const char* label, Pattern primary, Pattern fallback = {}) {
-    auto matches = scan_all(primary);
-    if (matches.size() == 1) {
-        write_log("%s found at %p", label, matches.front());
-        return matches.front();
-    }
-
-    write_log("%s primary pattern matched %zu location(s)", label, matches.size());
-
-    if (fallback.bytes != nullptr && fallback.size != 0) {
-        matches = scan_all(fallback);
-        if (matches.size() == 1) {
-            write_log("%s fallback found at %p", label, matches.front());
-            return matches.front();
-        }
-        write_log("%s fallback pattern matched %zu location(s)", label, matches.size());
-    }
-
-    return nullptr;
+    return result;
 }
 
 std::uint64_t path_to_hash_hook(wchar_t* path) {
     const auto hash = g_path_to_hash_original(path);
+    const auto call_index = g_path_call_count.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    if (call_index <= kMaxSampleLogs) {
+        write_log("PathToHash SAMPLE #%zu: hash=0x%016llX path=%ls",
+                  call_index,
+                  static_cast<unsigned long long>(hash),
+                  path != nullptr ? path : L"<null>");
+    }
 
     if (is_player_voice_path(path)) {
         const auto index = g_voice_path_log_count.fetch_add(1, std::memory_order_relaxed);
@@ -229,6 +251,15 @@ std::uint64_t path_to_hash_hook(wchar_t* path) {
 
 int check_file_in_pak_hook(void* context, std::uint64_t hash) {
     const int result = g_check_file_in_pak_original(context, hash);
+    const auto call_index = g_pak_call_count.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    if (call_index <= kMaxSampleLogs) {
+        write_log("CheckFileInPak SAMPLE #%zu: context=%p hash=0x%016llX original=%d",
+                  call_index,
+                  context,
+                  static_cast<unsigned long long>(hash),
+                  result);
+    }
 
     if (is_target_voice_hash(hash)) {
         write_log("EARLY CheckFileInPak TARGET: context=%p hash=0x%016llX original=%d",
@@ -262,6 +293,118 @@ bool install_hook(void* target, void* detour, void** original, const char* label
     return true;
 }
 
+void poll_worker() {
+    const auto ranges = executable_ranges();
+    if (ranges.empty()) {
+        write_log("Test8 poll aborted: no executable ranges found in MonsterHunterRise.exe");
+        return;
+    }
+
+    const auto init_status = MH_Initialize();
+    if (init_status != MH_OK && init_status != MH_ERROR_ALREADY_INITIALIZED) {
+        write_log("MH_Initialize failed: %d", static_cast<int>(init_status));
+        return;
+    }
+
+    std::size_t total_bytes{};
+    for (const auto& range : ranges) {
+        total_bytes += range.size;
+    }
+
+    write_log("Test8 poll worker started: %zu executable range(s), %zu bytes, timeout=%llums",
+              ranges.size(),
+              total_bytes,
+              static_cast<unsigned long long>(kPollTimeoutMs));
+    write_log("Each cycle scans unresolved signatures in one executable pass, then sleeps %lu ms.",
+              static_cast<unsigned long>(kPollSleepMs));
+
+    bool path_resolved = false;
+    bool pak_resolved = false;
+    bool path_hook_ok = false;
+    bool pak_hook_ok = false;
+    std::size_t cycle = 0;
+    const auto worker_start = GetTickCount64();
+
+    while ((!path_resolved || !pak_resolved) && GetTickCount64() - worker_start < kPollTimeoutMs) {
+        ++cycle;
+        const auto scan_start = GetTickCount64();
+        const auto matches = scan_targets_once(ranges, !path_resolved, !pak_resolved);
+        const auto scan_ms = GetTickCount64() - scan_start;
+
+        if (!path_resolved) {
+            if (matches.path_to_hash.count == 1) {
+                write_log("PathToHash FIRST APPEARED on poll #%zu at %p (scan=%llums)",
+                          cycle,
+                          matches.path_to_hash.first,
+                          static_cast<unsigned long long>(scan_ms));
+                path_hook_ok = install_hook(matches.path_to_hash.first,
+                                            reinterpret_cast<void*>(&path_to_hash_hook),
+                                            reinterpret_cast<void**>(&g_path_to_hash_original),
+                                            "PathToHash");
+                path_resolved = true;
+            } else if (matches.path_to_hash.count > 1) {
+                write_log("PathToHash became ambiguous on poll #%zu: %zu matches; refusing unsafe hook",
+                          cycle, matches.path_to_hash.count);
+                path_resolved = true;
+            }
+        }
+
+        if (!pak_resolved) {
+            void* pak_target = nullptr;
+            const char* variant = nullptr;
+
+            if (matches.check_primary.count == 1) {
+                pak_target = matches.check_primary.first;
+                variant = "primary";
+            } else if (matches.check_primary.count == 0 && matches.check_fallback.count == 1) {
+                pak_target = matches.check_fallback.first;
+                variant = "fallback";
+            }
+
+            if (pak_target != nullptr) {
+                write_log("CheckFileInPak FIRST APPEARED (%s) on poll #%zu at %p (scan=%llums)",
+                          variant,
+                          cycle,
+                          pak_target,
+                          static_cast<unsigned long long>(scan_ms));
+                pak_hook_ok = install_hook(pak_target,
+                                           reinterpret_cast<void*>(&check_file_in_pak_hook),
+                                           reinterpret_cast<void**>(&g_check_file_in_pak_original),
+                                           "CheckFileInPak");
+                pak_resolved = true;
+            } else if (matches.check_primary.count > 1 || matches.check_fallback.count > 1) {
+                write_log("CheckFileInPak became ambiguous on poll #%zu: primary=%zu fallback=%zu; refusing unsafe hook",
+                          cycle,
+                          matches.check_primary.count,
+                          matches.check_fallback.count);
+                pak_resolved = true;
+            }
+        }
+
+        if (cycle == 1 || (cycle % 5) == 0) {
+            write_log("Poll #%zu summary: scan=%llums path_matches=%zu pak_primary=%zu pak_fallback=%zu path_hook=%s pak_hook=%s",
+                      cycle,
+                      static_cast<unsigned long long>(scan_ms),
+                      matches.path_to_hash.count,
+                      matches.check_primary.count,
+                      matches.check_fallback.count,
+                      path_hook_ok ? "OK" : (path_resolved ? "FAILED" : "WAIT"),
+                      pak_hook_ok ? "OK" : (pak_resolved ? "FAILED" : "WAIT"));
+        }
+
+        if (!path_resolved || !pak_resolved) {
+            Sleep(kPollSleepMs);
+        }
+    }
+
+    const auto elapsed = GetTickCount64() - worker_start;
+    write_log("Test8 poll finished after %zu cycle(s), %llums: PathToHash=%s CheckFileInPak=%s",
+              cycle,
+              static_cast<unsigned long long>(elapsed),
+              path_hook_ok ? "HOOKED" : (path_resolved ? "FAILED" : "TIMEOUT"),
+              pak_hook_ok ? "HOOKED" : (pak_resolved ? "FAILED" : "TIMEOUT"));
+}
+
 } // namespace
 
 void set_attach_tick(std::uint64_t tick) {
@@ -278,7 +421,7 @@ void initialize() {
         return;
     }
 
-    // Use a dedicated log because this runs before REFramework's normal logger exists.
+    // Dedicated early log: REFramework's normal logger does not exist yet.
     {
         std::lock_guard lock{g_log_mutex};
         const auto path = log_path();
@@ -290,42 +433,16 @@ void initialize() {
         }
     }
 
-    write_log("Starting Test7 probe at the first startup_thread instruction before REFramework construction.");
-    write_log("Diagnostic only: hook return values are never modified.");
+    write_log("Starting Test8 at the first startup_thread instruction before REFramework construction.");
+    write_log("Diagnostic only: PathToHash / CheckFileInPak return values are never modified.");
     write_log("Targets: nonstream=0x%016llX streaming=0x%016llX",
               static_cast<unsigned long long>(kVoiceHashNonStreaming),
               static_cast<unsigned long long>(kVoiceHashStreaming));
+    write_log("Test7 showed the signatures are absent at +94ms; Test8 polls until they first appear and hooks each independently.");
 
-    auto* path_to_hash = scan_unique(
-        "PathToHash",
-        {kPathToHashPattern, sizeof(kPathToHashPattern)}
-    );
-
-    auto* check_file_in_pak = scan_unique(
-        "CheckFileInPak",
-        {kCheckFileInPakPattern1, sizeof(kCheckFileInPakPattern1)},
-        {kCheckFileInPakPattern2, sizeof(kCheckFileInPakPattern2)}
-    );
-
-    const auto init_status = MH_Initialize();
-    if (init_status != MH_OK && init_status != MH_ERROR_ALREADY_INITIALIZED) {
-        write_log("MH_Initialize failed: %d", static_cast<int>(init_status));
-        return;
-    }
-
-    const bool path_ok = install_hook(path_to_hash,
-                                      reinterpret_cast<void*>(&path_to_hash_hook),
-                                      reinterpret_cast<void**>(&g_path_to_hash_original),
-                                      "PathToHash");
-
-    const bool pak_ok = install_hook(check_file_in_pak,
-                                     reinterpret_cast<void*>(&check_file_in_pak_hook),
-                                     reinterpret_cast<void**>(&g_check_file_in_pak_original),
-                                     "CheckFileInPak");
-
-    write_log("Test7 probe installation complete: PathToHash=%s CheckFileInPak=%s",
-              path_ok ? "OK" : "FAILED",
-              pak_ok ? "OK" : "FAILED");
+    // Do not block REFramework startup while repeatedly scanning a large executable image.
+    // This worker begins immediately, but the normal startup_thread continues in parallel.
+    std::thread{poll_worker}.detach();
 }
 
 } // namespace mhr_early_hook_probe
@@ -392,9 +509,9 @@ __declspec(dllexport) HRESULT WINAPI
 }
 
 void startup_thread(HMODULE reframework_module) {
-    // Test7: run the MH Rise resource probe before exception setup, system dinput8
-    // loading, REFramework construction, mod initialization, Lua, or PluginLoader.
-    // The probe is diagnostic only and never changes game return values.
+    // Test8: start the MH Rise resource polling probe before exception setup,
+    // system dinput8 loading, REFramework construction, mod initialization,
+    // Lua, or PluginLoader. The worker scans in parallel so startup is not blocked.
     mhr_early_hook_probe::initialize();
 
     // We will set it once here, then do it continuously
