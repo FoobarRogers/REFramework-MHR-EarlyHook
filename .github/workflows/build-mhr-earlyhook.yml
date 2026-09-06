@@ -1,0 +1,57 @@
+name: Build MHR EarlyHook Test7
+
+on:
+  push:
+    branches:
+      - test/mhr-early-hook
+    paths:
+      - src/Main.cpp
+      - src/MHREarlyHookProbe.cpp
+      - src/MHREarlyHookProbe.hpp
+      - .github/workflows/build-mhr-earlyhook.yml
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout fork test branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure x64 Release
+        run: cmake -S ${{github.workspace}} -B ${{github.workspace}}/build -G "Visual Studio 18 2026" -A x64 -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DDEVELOPER_MODE=ON "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+
+      - name: Build REFramework dinput8.dll
+        run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target REFramework
+
+      - name: Package Test7
+        shell: powershell
+        run: |
+          $package = "${{github.workspace}}/Test7"
+          New-Item -ItemType Directory -Force -Path $package | Out-Null
+          Copy-Item "${{github.workspace}}/build/bin/REFramework/dinput8.dll" "$package/dinput8.dll"
+          "${{github.sha}}" | Set-Content "$package/reframework_revision.txt"
+          @"
+          MHR EarlyHook Test7
+          Base: REFramework 849c35a041fa4d748b42a2fb5ebe53f402875311
+          Branch: test/mhr-early-hook
+
+          Diagnostic build only. It writes mhr_earlyhook_test7.log to the MonsterHunterRise game directory.
+          For the clean timing test, disable the built-in Loose File Loader and temporarily remove reframework/plugins/FirstNatives.dll.
+          "@ | Set-Content "$package/TEST7_README.txt"
+          Compress-Archive -Path "$package/*" -DestinationPath "${{github.workspace}}/REFramework-MHR-EarlyHook-Test7.zip" -Force
+
+      - name: Upload Test7 artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
+        with:
+          name: REFramework-MHR-EarlyHook-Test7
+          path: ${{github.workspace}}/REFramework-MHR-EarlyHook-Test7.zip
+          if-no-files-found: error
