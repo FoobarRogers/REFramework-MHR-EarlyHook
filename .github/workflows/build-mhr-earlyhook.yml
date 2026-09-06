@@ -1,6 +1,12 @@
 name: Build MHR EarlyHook Test7
 
 on:
+  push:
+    branches:
+      - test/mhr-early-hook
+    paths:
+      - src/Main.cpp
+      - .github/workflows/build-mhr-earlyhook.yml
   workflow_dispatch:
 
 env:
